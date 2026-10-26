@@ -5117,7 +5117,7 @@ function renderSheet(it){
     fileInput.onchange = (e) => {
       const file = e.target.files[0];
       if(!file) return;
-      processImageFile(file, 360, 0.82, (dataUrl) => {
+      processImageFile(file, 800, 0.82, (dataUrl) => {
         draft.img = dataUrl;
         syncFields();
         renderSheet(it);
@@ -5726,7 +5726,7 @@ function openAddNewItemModal() {
     fileInput.onchange = (e) => {
       const file = e.target.files[0];
       if(!file) return;
-      processImageFile(file, 360, 0.82, (dataUrl) => {
+      processImageFile(file, 800, 0.82, (dataUrl) => {
         tempNewItemImg = dataUrl;
         if(previewImg){
           previewImg.src = dataUrl;
@@ -5976,7 +5976,7 @@ function openImageLightbox(id){
     fileInput.onchange = (e) => {
       const file = e.target.files[0];
       if(!file) return;
-      processImageFile(file, 360, 0.82, (dataUrl) => {
+      processImageFile(file, 800, 0.82, (dataUrl) => {
         setItemImg(id, dataUrl);
         render();
         openImageLightbox(id);
@@ -5989,7 +5989,7 @@ function openImageLightbox(id){
     btnApplyUrl.onclick = () => {
       const url = txtUrl.value.trim();
       if(!url) { toast('يرجى كتابة أو لصق رابط الصورة'); txtUrl.focus(); return; }
-      processImageUrl(url, 360, 0.82, (dataUrl) => {
+      processImageUrl(url, 800, 0.82, (dataUrl) => {
         setItemImg(id, dataUrl);
         render();
         openImageLightbox(id);
@@ -6036,7 +6036,7 @@ function openImageLightbox(id){
       e.preventDefault();
       dropZone.style.borderColor = 'var(--line)';
       if(e.dataTransfer.files && e.dataTransfer.files.length > 0){
-        processImageFile(e.dataTransfer.files[0], 360, 0.82, (dataUrl) => {
+        processImageFile(e.dataTransfer.files[0], 800, 0.82, (dataUrl) => {
           setItemImg(id, dataUrl);
           render();
           openImageLightbox(id);
@@ -6045,7 +6045,7 @@ function openImageLightbox(id){
       } else {
         const url = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain');
         if(url && (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('data:image/'))){
-          processImageUrl(url, 360, 0.82, (dataUrl) => {
+          processImageUrl(url, 800, 0.82, (dataUrl) => {
             setItemImg(id, dataUrl);
             render();
             openImageLightbox(id);
