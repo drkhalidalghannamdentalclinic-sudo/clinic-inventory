@@ -276,6 +276,15 @@ h1{font-size:1.45rem;margin:0;font-weight:700;letter-spacing:0}
 /* invoice modal zoom, pan & autocomplete */
 .invoice-img-viewport{width:100%;height:320px;overflow:hidden;position:relative;border-radius:10px;background:#0f172a;display:flex;align-items:center;justify-content:center;user-select:none}
 .invoice-img-viewport img{max-width:98%;max-height:98%;transition:transform .12s ease-out;transform-origin:center center;display:block}
+.zoom-viewer{position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.92);display:flex;align-items:center;justify-content:center;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}
+.zoom-viewer img{max-width:96vw;max-height:84vh;object-fit:contain;transform-origin:center center;will-change:transform;cursor:grab;-webkit-user-drag:none}
+.zoom-viewer img.dragging{cursor:grabbing}
+.zoom-bar{position:absolute;top:calc(10px + env(safe-area-inset-top,0px));inset-inline:12px;display:flex;align-items:center;gap:8px;color:#fff;pointer-events:none}
+.zoom-bar .zoom-title{flex:1;font-weight:700;font-size:.95rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.zoom-bar button,.zoom-ctrls button{pointer-events:auto;background:rgba(255,255,255,.16);color:#fff;border:1px solid rgba(255,255,255,.28);border-radius:999px;min-width:42px;height:42px;font-size:1.1rem;cursor:pointer;padding:0 12px}
+.zoom-ctrls{position:absolute;bottom:calc(16px + env(safe-area-inset-bottom,0px));left:0;right:0;display:flex;justify-content:center;gap:10px}
+.zoom-hint{position:absolute;bottom:calc(66px + env(safe-area-inset-bottom,0px));left:0;right:0;text-align:center;color:rgba(255,255,255,.7);font-size:.78rem;pointer-events:none}
+#lightboxPreviewImg{cursor:zoom-in}
 .invoice-zoom-bar{position:absolute;bottom:8px;left:50%;transform:translateX(-50%);background:rgba(15,23,42,0.85);backdrop-filter:blur(4px);padding:4px 10px;border-radius:20px;display:flex;gap:6px;z-index:10;box-shadow:0 4px 10px rgba(0,0,0,0.3)}
 .invoice-zoom-bar button{background:transparent;border:none;color:#fff;font-size:.85rem;cursor:pointer;padding:3px 8px;border-radius:6px;font-weight:700}
 .invoice-zoom-bar button:hover{background:rgba(255,255,255,0.25)}
@@ -5798,6 +5807,97 @@ function openRenameModal(id) {
   };
 }
 
+/* ---------- fullscreen zoom viewer (pinch / wheel / double-tap / drag) ---------- */
+function openImageZoom(src, title){
+  const old = document.getElementById('zoomViewer');
+  if(old) old.remove();
+  const v = document.createElement('div');
+  v.id = 'zoomViewer';
+  v.className = 'zoom-viewer';
+  v.innerHTML = `
+    <div class="zoom-bar"><span class="zoom-title">${esc(title || '')}</span><button type="button" id="zvClose" aria-label="إغلاق">✕</button></div>
+    <img id="zvImg" alt="${esc(title || '')}" draggable="false" referrerpolicy="no-referrer">
+    <div class="zoom-hint">اضغط مرتين أو استخدم إصبعين / عجلة الماوس للتكبير</div>
+    <div class="zoom-ctrls">
+      <button type="button" id="zvOut" aria-label="تصغير">−</button>
+      <button type="button" id="zvReset" aria-label="إعادة ضبط">100%</button>
+      <button type="button" id="zvIn" aria-label="تكبير">+</button>
+    </div>`;
+  document.body.appendChild(v);
+  const img = v.querySelector('#zvImg');
+  img.src = src;
+
+  let scale = 1, tx = 0, ty = 0;
+  const MIN = 1, MAX = 8;
+  const pts = new Map();
+  let pinchDist = 0, pinchScale = 1, lastTap = 0;
+
+  const apply = () => {
+    if(scale <= 1){ tx = 0; ty = 0; }
+    img.style.transform = `translate(${tx}px,${ty}px) scale(${scale})`;
+    v.querySelector('#zvReset').textContent = Math.round(scale * 100) + '%';
+  };
+  const setScale = (s) => { scale = Math.min(MAX, Math.max(MIN, s)); apply(); };
+  const close = () => { document.removeEventListener('keydown', onKey); v.remove(); };
+  const onKey = (e) => {
+    if(e.key === 'Escape') close();
+    else if(e.key === '+' || e.key === '=') setScale(scale * 1.4);
+    else if(e.key === '-') setScale(scale / 1.4);
+  };
+  document.addEventListener('keydown', onKey);
+
+  v.querySelector('#zvClose').onclick = close;
+  v.querySelector('#zvIn').onclick = () => setScale(scale * 1.4);
+  v.querySelector('#zvOut').onclick = () => setScale(scale / 1.4);
+  v.querySelector('#zvReset').onclick = () => { scale = 1; apply(); };
+  v.addEventListener('click', (e) => { if(e.target === v) close(); });
+
+  v.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    setScale(scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15));
+  }, { passive: false });
+
+  img.addEventListener('dblclick', () => setScale(scale > 1 ? 1 : 2.5));
+
+  img.addEventListener('pointerdown', (e) => {
+    img.setPointerCapture(e.pointerId);
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if(pts.size === 2){
+      const [a, b] = [...pts.values()];
+      pinchDist = Math.hypot(a.x - b.x, a.y - b.y);
+      pinchScale = scale;
+    } else if(e.pointerType === 'touch'){
+      const now = Date.now();
+      if(now - lastTap < 300){ setScale(scale > 1 ? 1 : 2.5); lastTap = 0; }
+      else lastTap = now;
+    }
+    img.classList.add('dragging');
+  });
+  img.addEventListener('pointermove', (e) => {
+    const p = pts.get(e.pointerId);
+    if(!p) return;
+    if(pts.size === 2){
+      pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      const [a, b] = [...pts.values()];
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      if(pinchDist) setScale(pinchScale * d / pinchDist);
+    } else if(scale > 1){
+      tx += e.clientX - p.x;
+      ty += e.clientY - p.y;
+      pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      apply();
+    }
+  });
+  const up = (e) => {
+    pts.delete(e.pointerId);
+    pinchDist = 0;
+    if(!pts.size) img.classList.remove('dragging');
+  };
+  img.addEventListener('pointerup', up);
+  img.addEventListener('pointercancel', up);
+  apply();
+}
+
 /* ---------- image lightbox modal ---------- */
 function openImageLightbox(id){
   const it = getAllItems().find(x=>x.id===id);
@@ -5812,6 +5912,7 @@ function openImageLightbox(id){
   h += `
     <div id="lightboxDropZone" style="display:flex;flex-direction:column;align-items:center;justify-content:center;margin:10px 0 14px;background:var(--bg);border-radius:14px;padding:12px;border:2px dashed var(--line);position:relative;transition:border-color .2s ease">
       ${curImg ? `<img src="${curImg}" alt="${esc(nm)}" id="lightboxPreviewImg" style="max-width:100%;max-height:46vh;border-radius:10px;object-fit:contain;box-shadow:0 4px 14px rgba(0,0,0,0.08)" referrerpolicy="no-referrer">` : `<div style="padding:28px 12px;text-align:center"><span style="font-size:3rem">📷</span><div style="color:var(--muted);font-size:.85rem;margin-top:6px">لا توجد صورة لهذا الصنف حالياً</div></div>`}
+      ${curImg ? `<button type="button" class="btn small primary" id="btnLightboxZoom" style="margin-top:8px;font-size:.84rem">🔍 تكبير الصورة</button>` : ''}
       <div style="margin-top:8px">
         ${isCustom ? `<span style="font-size:.76rem;background:var(--ok-soft);color:var(--ok);padding:3px 10px;border-radius:999px;font-weight:600">📷 صورة مخصصة من قِبلك</span>` : `<span style="font-size:.76rem;background:var(--none-soft);color:var(--brand);padding:3px 10px;border-radius:999px;font-weight:600">✨ صورة معتمدة تلقائياً بحسب مواصفات واسم الصنف</span>`}
       </div>
@@ -5854,6 +5955,14 @@ function openImageLightbox(id){
   const btnOpenItem = $('btnLightboxOpenItem');
   const btnClose = $('btnLightboxClose');
   const dropZone = $('lightboxDropZone');
+
+  if(curImg){
+    const zoom = () => openImageZoom(curImg, nm);
+    const prev = $('lightboxPreviewImg');
+    if(prev) prev.onclick = zoom;
+    const bz = $('btnLightboxZoom');
+    if(bz) bz.onclick = zoom;
+  }
 
   if(btnSearchGoogle){
     btnSearchGoogle.onclick = () => {
