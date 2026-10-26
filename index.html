@@ -657,10 +657,11 @@ function updateTestSoundBtnState(isPlaying) {
 /* ---------- local persistence & auto-save ---------- */
 function lsGet(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
 let _lsFailToastAt = 0;
-function lsSet(k,v){
+function lsSet(k,v,quiet){
   try{ localStorage.setItem(k,v); return true; }
   catch(e){
     console.warn('localStorage write failed for', k, e);
+    if(quiet) return false;
     const now = Date.now();
     if(now - _lsFailToastAt > 8000 && typeof toast === 'function'){
       _lsFailToastAt = now;
@@ -669,6 +670,86 @@ function lsSet(k,v){
     return false;
   }
 }
+
+/* ---------- image store (IndexedDB): keeps photos out of the ~5MB localStorage ---------- */
+const IMG_MARK = '@idb';
+const isDataImg = v => typeof v === 'string' && v.startsWith('data:');
+const ImgStore = (() => {
+  let db = null, hydratedOk = false;
+  const committed = new Map();   // key -> dataUrl known to be safely stored in IndexedDB
+  const inflight = new Map();    // key -> dataUrl currently being written
+  const open = () => new Promise(res => {
+    try{
+      const r = indexedDB.open('clinic_images', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('imgs');
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => res(null);
+      r.onblocked = () => res(null);
+    }catch(e){ res(null); }
+  });
+  const readAll = () => new Promise(res => {
+    const m = new Map();
+    try{
+      const cur = db.transaction('imgs','readonly').objectStore('imgs').openCursor();
+      cur.onsuccess = () => { const c = cur.result; if(c){ m.set(c.key, c.value); c.continue(); } else res(m); };
+      cur.onerror = () => res(null);
+    }catch(e){ res(null); }
+  });
+  // every image slot in memory: [key, holderObject]
+  const slots = () => {
+    const out = [];
+    Object.keys(entries).forEach(id => { if(entries[id]) out.push(['e:'+id, entries[id]]); });
+    customItems.forEach(c => { if(c) out.push(['c:'+c.id, c]); });
+    companyInvoices.forEach(v => { if(v) out.push(['v:'+v.id, v]); });
+    return out;
+  };
+  const hydrated = open().then(async d => {
+    db = d;
+    if(!db) return;
+    const stored = await readAll();
+    if(!stored) return;
+    slots().forEach(([k, o]) => {
+      if(o.img === IMG_MARK){
+        if(stored.has(k)){ o.img = stored.get(k); committed.set(k, o.img); }
+        else delete o.img;                       // image really gone: fall back to default visual
+      } else if(isDataImg(o.img) && stored.get(k) === o.img){
+        committed.set(k, o.img);
+      }
+    });
+    hydratedOk = true;
+  }).catch(() => {});
+  function sync(){
+    if(!db || !hydratedOk) return;
+    const want = new Map();
+    slots().forEach(([k, o]) => { if(isDataImg(o.img)) want.set(k, o.img); });
+    const puts = [], dels = [];
+    want.forEach((v, k) => { if(committed.get(k) !== v && inflight.get(k) !== v) puts.push([k, v]); });
+    committed.forEach((v, k) => { if(!want.has(k)) dels.push(k); });
+    if(!puts.length && !dels.length) return;
+    try{
+      const tx = db.transaction('imgs','readwrite');
+      const st = tx.objectStore('imgs');
+      puts.forEach(([k, v]) => { inflight.set(k, v); st.put(v, k); });
+      dels.forEach(k => st.delete(k));
+      tx.oncomplete = () => {
+        puts.forEach(([k, v]) => { committed.set(k, v); inflight.delete(k); });
+        dels.forEach(k => committed.delete(k));
+        if(puts.length) setTimeout(() => saveLocal(true), 0);   // now safe to strip them from localStorage
+      };
+      tx.onerror = tx.onabort = () => { puts.forEach(([k]) => inflight.delete(k)); };
+    }catch(e){ puts.forEach(([k]) => inflight.delete(k)); }
+  }
+  // copy for localStorage: photos already safe in IndexedDB become a small marker
+  // withPending: also mark photos whose IndexedDB write is still in flight (used only when the inline copy does not fit)
+  const forLs = (k, v, withPending) => (v && isDataImg(v.img) && (committed.get(k) === v.img || (withPending && inflight.get(k) === v.img))) ? Object.assign({}, v, { img: IMG_MARK }) : v;
+  const lsEntries = w => { const o = {}; Object.keys(entries).forEach(id => { o[id] = forLs('e:'+id, entries[id], w); }); return o; };
+  const lsCustom = w => customItems.map(c => forLs('c:'+(c && c.id), c, w));
+  const lsInvoices = w => companyInvoices.map(v => forLs('v:'+(v && v.id), v, w));
+  // copy without any photo data, for the cloud payload
+  const noImg = v => { if(!(v && isDataImg(v.img))) return v; const c = Object.assign({}, v); delete c.img; return c; };
+  const cloudEntries = () => { const o = {}; Object.keys(entries).forEach(id => { o[id] = noImg(entries[id]); }); return o; };
+  return { hydrated, sync, lsEntries, lsCustom, lsInvoices, cloudEntries, noImg };
+})();
 
 /* ---------- Live Cloud Sync Engine ---------- */
 const DEFAULT_CLOUD_SYNC_KEY = 'dedfaed';
@@ -770,22 +851,19 @@ async function pushClinicDataToCloud(showToast = false, keepAlive = false) {
   if (!syncKey) return false;
 
   const localUpdated = parseInt(lsGet('clinic_local_updated_at') || '0', 10) || Date.now();
-  const apiKey = (typeof getGeminiApiKey === 'function') ? getGeminiApiKey() : (lsGet('clinic_gemini_api_key') || '');
-
   const payload = {
     v: 5,
     updatedAt: localUpdated,
     clinicName: clinicName || 'جرد العيادة',
     clinicLogo: clinicLogo || '',
     months: months || 6,
-    geminiApiKey: apiKey,
-    entries: entries || {},
-    customItems: customItems || [],
+    entries: ImgStore.cloudEntries(),
+    customItems: (customItems || []).map(ImgStore.noImg),
     postponedItems: postponedItems || {},
     companiesList: companiesList || [],
     itemCompanies: itemCompanies || {},
     placedOrders: placedOrders || {},
-    companyInvoices: companyInvoices || [],
+    companyInvoices: (companyInvoices || []).map(ImgStore.noImg),
     companyPayments: companyPayments || []
   };
 
@@ -837,6 +915,7 @@ async function pushClinicDataToCloud(showToast = false, keepAlive = false) {
 
 async function pullClinicDataFromCloud(silent = false) {
   if (!isCloudSyncEnabled()) return;
+  await ImgStore.hydrated;
   const syncKey = getCloudSyncKey();
   if (!syncKey) return;
 
@@ -901,6 +980,10 @@ async function pullClinicDataFromCloud(silent = false) {
 
 function applyCloudData(data) {
   if (!data || typeof data !== 'object') return;
+  const prevImgs = new Map();   // photos live only on this device: re-attach them after taking remote data
+  Object.keys(entries).forEach(id => { if(entries[id] && isDataImg(entries[id].img)) prevImgs.set('e:'+id, entries[id].img); });
+  customItems.forEach(c => { if(c && isDataImg(c.img)) prevImgs.set('c:'+c.id, c.img); });
+  companyInvoices.forEach(v => { if(v && isDataImg(v.img)) prevImgs.set('v:'+v.id, v.img); });
   if (data.entries && typeof data.entries === 'object') entries = data.entries;
   if (Array.isArray(data.customItems)) customItems = data.customItems;
   if (data.postponedItems && typeof data.postponedItems === 'object') postponedItems = data.postponedItems;
@@ -918,9 +1001,10 @@ function applyCloudData(data) {
     if (typeof updateLogoDisplay === 'function') updateLogoDisplay();
   }
   if (data.months && data.months > 0 && data.months <= 36) months = data.months;
-  if (data.geminiApiKey && typeof setGeminiApiKey === 'function' && !getGeminiApiKey()) {
-    setGeminiApiKey(data.geminiApiKey);
-  }
+  const restoreImg = (k, o) => { if(o && !o.img && prevImgs.has(k)) o.img = prevImgs.get(k); };
+  Object.keys(entries).forEach(id => restoreImg('e:'+id, entries[id]));
+  customItems.forEach(c => restoreImg('c:'+(c && c.id), c));
+  companyInvoices.forEach(v => restoreImg('v:'+(v && v.id), v));
   if (data.updatedAt) {
     lsSet('clinic_local_updated_at', String(data.updatedAt));
   }
@@ -1222,13 +1306,14 @@ function loadLocal(){
   }catch(e){}
 }
 function saveLocal(skipCloud = false){
-  lsSet('clinic_inv_v1', JSON.stringify(entries));
-  lsSet('clinic_custom_items', JSON.stringify(customItems));
+  ImgStore.sync();
+  lsSet('clinic_inv_v1', JSON.stringify(ImgStore.lsEntries()), true) || lsSet('clinic_inv_v1', JSON.stringify(ImgStore.lsEntries(true)));
+  lsSet('clinic_custom_items', JSON.stringify(ImgStore.lsCustom()), true) || lsSet('clinic_custom_items', JSON.stringify(ImgStore.lsCustom(true)));
   lsSet('clinic_postponed_v1', JSON.stringify(postponedItems));
   lsSet('clinic_companies', JSON.stringify(companiesList));
   lsSet('clinic_item_companies', JSON.stringify(itemCompanies));
   lsSet('clinic_placed_orders', JSON.stringify(placedOrders));
-  lsSet('clinic_company_invoices', JSON.stringify(companyInvoices));
+  lsSet('clinic_company_invoices', JSON.stringify(ImgStore.lsInvoices()), true) || lsSet('clinic_company_invoices', JSON.stringify(ImgStore.lsInvoices(true)));
   lsSet('clinic_company_payments', JSON.stringify(companyPayments));
   try{ localStorage.removeItem('clinic_order_status'); }catch(e){}
   lsSet('clinic_name', clinicName);
@@ -1674,19 +1759,19 @@ function getDentalItemVisual(it) {
 
 function hasCustomItemImg(id){
   const en = entries[id];
-  if(en && en.img && en.img !== '__NONE__') return true;
+  if(en && en.img && en.img !== '__NONE__' && en.img !== IMG_MARK) return true;
   const ci = customItems.find(x => x.id === id);
-  if(ci && ci.img && ci.img !== '__NONE__') return true;
+  if(ci && ci.img && ci.img !== '__NONE__' && ci.img !== IMG_MARK) return true;
   return false;
 }
 
 function getItemImg(id){
   const en = entries[id];
   if(en && en.img === '__NONE__') return null;
-  if(en && en.img) return en.img;
+  if(en && en.img && en.img !== IMG_MARK) return en.img;
   const ci = customItems.find(x => x.id === id);
   if(ci && ci.img === '__NONE__') return null;
-  if(ci && ci.img) return ci.img;
+  if(ci && ci.img && ci.img !== IMG_MARK) return ci.img;
 
   // Fallback to intelligent built-in dental visual
   const it = getAllItems().find(x => x.id === id);
@@ -6125,6 +6210,7 @@ if($('btnStopAlarmSound')){
 
 loadLocal();
 render();
+ImgStore.hydrated.then(() => { render(); saveLocal(true); });
 
 if($('btnCloudSync')){
   $('btnCloudSync').onclick = openCloudSyncModal;
