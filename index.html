@@ -855,7 +855,7 @@ function updateCloudSyncStatusIndicator(state, timestamp = null, errorMsg = '') 
 
 /* ---------- Google Drive sync (hidden app folder: free, private, no card) ---------- */
 // One-time setup: paste the OAuth *Web* client ID (public, safe to commit) from Google Cloud Console.
-const GOOGLE_CLIENT_ID = '';
+const GOOGLE_CLIENT_ID = '66755429991-l5l6ibo3gbkamgqep67dg4ernvqt7oom.apps.googleusercontent.com';
 const GD_SCOPE = 'https://www.googleapis.com/auth/drive.appdata';
 const GD_API = () => window.__GD_BASE || 'https://www.googleapis.com';
 let gdToken = null, gdExpires = 0, gdClient = null, gdReauthArmed = false;
