@@ -711,7 +711,7 @@ const ImgStore = (() => {
     slots().forEach(([k, o]) => {
       if(o.img === IMG_MARK){
         if(stored.has(k)){ o.img = stored.get(k); committed.set(k, o.img); }
-        else delete o.img;                       // image really gone: fall back to default visual
+        // blob missing: keep the marker (UI treats it as 'no photo'); never destroy the reference
       } else if(isDataImg(o.img) && stored.get(k) === o.img){
         committed.set(k, o.img);
       }
@@ -721,22 +721,27 @@ const ImgStore = (() => {
   function sync(){
     if(!db || !hydratedOk) return;
     const want = new Map();
-    slots().forEach(([k, o]) => { if(isDataImg(o.img)) want.set(k, o.img); });
-    const puts = [], dels = [];
+    slots().forEach(([k, o]) => {
+      if(o.img === IMG_MARK && committed.has(k)) o.img = committed.get(k);   // marker leaked into memory: put the real photo back
+      if(isDataImg(o.img)) want.set(k, o.img);
+    });
+    // Photos are never deleted automatically: a wrong delete is unrecoverable, an orphaned blob costs almost nothing.
+    const puts = [];
     want.forEach((v, k) => { if(committed.get(k) !== v && inflight.get(k) !== v) puts.push([k, v]); });
-    committed.forEach((v, k) => { if(!want.has(k)) dels.push(k); });
-    if(!puts.length && !dels.length) return;
+    if(!puts.length) return;
     try{
       const tx = db.transaction('imgs','readwrite');
       const st = tx.objectStore('imgs');
       puts.forEach(([k, v]) => { inflight.set(k, v); st.put(v, k); });
-      dels.forEach(k => st.delete(k));
       tx.oncomplete = () => {
         puts.forEach(([k, v]) => { committed.set(k, v); inflight.delete(k); });
-        dels.forEach(k => committed.delete(k));
-        if(puts.length) setTimeout(() => saveLocal(true), 0);   // now safe to strip them from localStorage
+        setTimeout(() => saveLocal(true), 0);   // now safe to strip them from localStorage
       };
-      tx.onerror = tx.onabort = () => { puts.forEach(([k]) => inflight.delete(k)); };
+      tx.onerror = tx.onabort = () => {
+        puts.forEach(([k]) => inflight.delete(k));
+        setTimeout(() => saveLocal(true), 0);
+        if(typeof toast === 'function') toast('⚠️ تعذّر حفظ صورة على الجهاز — احتفظ بنسخة احتياطية');
+      };
     }catch(e){ puts.forEach(([k]) => inflight.delete(k)); }
   }
   // copy for localStorage: photos already safe in IndexedDB become a small marker
@@ -746,7 +751,7 @@ const ImgStore = (() => {
   const lsCustom = w => customItems.map(c => forLs('c:'+(c && c.id), c, w));
   const lsInvoices = w => companyInvoices.map(v => forLs('v:'+(v && v.id), v, w));
   // copy without any photo data, for the cloud payload
-  const noImg = v => { if(!(v && isDataImg(v.img))) return v; const c = Object.assign({}, v); delete c.img; return c; };
+  const noImg = v => { if(!(v && v.img && v.img !== '__NONE__')) return v; const c = Object.assign({}, v); delete c.img; return c; };
   const cloudEntries = () => { const o = {}; Object.keys(entries).forEach(id => { o[id] = noImg(entries[id]); }); return o; };
   return { hydrated, sync, lsEntries, lsCustom, lsInvoices, cloudEntries, noImg };
 })();
@@ -981,9 +986,9 @@ async function pullClinicDataFromCloud(silent = false) {
 function applyCloudData(data) {
   if (!data || typeof data !== 'object') return;
   const prevImgs = new Map();   // photos live only on this device: re-attach them after taking remote data
-  Object.keys(entries).forEach(id => { if(entries[id] && isDataImg(entries[id].img)) prevImgs.set('e:'+id, entries[id].img); });
-  customItems.forEach(c => { if(c && isDataImg(c.img)) prevImgs.set('c:'+c.id, c.img); });
-  companyInvoices.forEach(v => { if(v && isDataImg(v.img)) prevImgs.set('v:'+v.id, v.img); });
+  Object.keys(entries).forEach(id => { if(entries[id] && entries[id].img && entries[id].img !== '__NONE__') prevImgs.set('e:'+id, entries[id].img); });
+  customItems.forEach(c => { if(c && c.img && c.img !== '__NONE__') prevImgs.set('c:'+c.id, c.img); });
+  companyInvoices.forEach(v => { if(v && v.img && v.img !== '__NONE__') prevImgs.set('v:'+v.id, v.img); });
   if (data.entries && typeof data.entries === 'object') entries = data.entries;
   if (Array.isArray(data.customItems)) customItems = data.customItems;
   if (data.postponedItems && typeof data.postponedItems === 'object') postponedItems = data.postponedItems;
@@ -1001,7 +1006,9 @@ function applyCloudData(data) {
     if (typeof updateLogoDisplay === 'function') updateLogoDisplay();
   }
   if (data.months && data.months > 0 && data.months <= 36) months = data.months;
-  const restoreImg = (k, o) => { if(o && !o.img && prevImgs.has(k)) o.img = prevImgs.get(k); };
+  const restoreImg = (k, o) => { if(o && (!o.img || (o.img !== '__NONE__' && !isDataImg(o.img))) && prevImgs.has(k)) o.img = prevImgs.get(k); };
+  // a photo-only entry that the remote no longer has must not lose its photo
+  prevImgs.forEach((v, k) => { if(k.startsWith('e:') && !entries[k.slice(2)]) entries[k.slice(2)] = { b: [], r: '', nt: '', img: v }; });
   Object.keys(entries).forEach(id => restoreImg('e:'+id, entries[id]));
   customItems.forEach(c => restoreImg('c:'+(c && c.id), c));
   companyInvoices.forEach(v => restoreImg('v:'+(v && v.id), v));
@@ -4617,7 +4624,7 @@ function openCompanyLedgerModal(selectedComp = null){
                           ${isRet ? '-' : ''}${(Number(inv.total) || 0).toLocaleString()} ج.م
                         </td>
                         <td style="text-align:center">
-                          ${inv.img ? `<button type="button" class="btn small ghost btn-view-inv-photo" data-id="${inv.id}" style="padding:2px 8px;font-size:.76rem">📷 عرض الصورة</button>` : '<span style="color:var(--muted);font-size:.76rem">بدون صورة</span>'}
+                          ${isDataImg(inv.img) ? `<button type="button" class="btn small ghost btn-view-inv-photo" data-id="${inv.id}" style="padding:2px 8px;font-size:.76rem">📷 عرض الصورة</button>` : '<span style="color:var(--muted);font-size:.76rem">بدون صورة</span>'}
                         </td>
                         <td style="font-size:.8rem;color:var(--muted)">${esc(inv.staff || 'غير محدد')}</td>
                         <td style="text-align:center">
@@ -4895,7 +4902,7 @@ function openAddPaymentModal(compName, suggestedAmt = 0){
 
 function openInvoicePhotoLightbox(invoiceId){
   const inv = companyInvoices.find(x => x.id === invoiceId);
-  if(!inv || !inv.img) return;
+  if(!inv || !isDataImg(inv.img)) return;
 
   let h = `
     <div style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line);padding-bottom:8px;margin-bottom:10px">
@@ -5078,7 +5085,9 @@ function openItem(id){
   const en=entries[id];
   draft = en ? JSON.parse(JSON.stringify(en)) : {b:[],r:'',nt:''};
   draft.es = isEss(it);
-  draft.img = (en && typeof en.img === 'string') ? en.img : '';
+  const _ciImg = (customItems.find(x => x.id === it.id) || {}).img;
+  const _rawImg = (en && typeof en.img === 'string' && en.img) ? en.img : (typeof _ciImg === 'string' ? _ciImg : '');
+  draft.img = (_rawImg === IMG_MARK) ? '' : _rawImg;
   if(!draft.b.length) draft.b.push({e:'',q:''});
   renderSheet(it);
   $('scrim').classList.add('open');
@@ -5672,7 +5681,7 @@ $('btnSettings').onclick=()=>{
       toast('🔊 بدأ تشغيل التنبيه الصوتي العالي المستمر — اضغط مجدداً أو على الشريط لإيقافه');
     }
   };
-  $('expJson').onclick=()=>download('inventory-backup-'+new Date().toISOString().slice(0,10)+'.json', JSON.stringify({v:4,months,entries,customItems,postponedItems,companiesList,itemCompanies,placedOrders,companyInvoices,companyPayments,clinicName,clinicLogo},null,1));
+  $('expJson').onclick=async()=>{ await ImgStore.hydrated; if(JSON.stringify([entries,customItems,companyInvoices]).includes('"'+IMG_MARK+'"')) toast('⚠️ بعض الصور لم تُحمَّل بعد — أعد فتح التطبيق وكرر النسخ الاحتياطي لتشمل الصور'); download('inventory-backup-'+new Date().toISOString().slice(0,10)+'.json', JSON.stringify({v:4,months,entries,customItems,postponedItems,companiesList,itemCompanies,placedOrders,companyInvoices,companyPayments,clinicName,clinicLogo},null,1)); };
   $('expCsv').onclick=()=>download('inventory.csv', '\ufeff'+toCsv());
   $('impBtn').onclick=()=>$('impFile').click();
   $('impFile').onchange=e=>{
