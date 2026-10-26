@@ -5844,6 +5844,20 @@ $('btnSettings').onclick=()=>{
       const btn = $('btnSyncGoogleDriveNow');
       btn.disabled = true;
       btn.innerHTML = '⏳ جاري المزامنة...';
+      if (GOOGLE_CLIENT_ID && !(gdToken && Date.now() < gdExpires)) {
+        // first use or expired: this tap is the user gesture Google needs for its sign-in window
+        try {
+          await gdRequestToken(lsGet('clinic_gd_connected') ? '' : 'consent');
+          setCloudSyncProvider('gdrive');
+          setCloudSyncEnabled(true);
+          await pullClinicDataFromCloud(true);
+        } catch (e) {
+          btn.disabled = false;
+          btn.innerHTML = '🔄 مزامنة مع Google Drive الآن';
+          toast('تعذر الربط بـ Google Drive: ' + e.message);
+          return;
+        }
+      }
       toast('جاري مزامنة كافة البيانات والإعدادات مع Google Drive والسحابة...');
       const ok = await syncToGoogleDriveNow(true, false);
       btn.disabled = false;
