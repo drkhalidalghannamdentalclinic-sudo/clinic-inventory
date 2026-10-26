@@ -753,7 +753,7 @@ const ImgStore = (() => {
   // copy without any photo data, for the cloud payload
   const noImg = v => { if(!(v && v.img && v.img !== '__NONE__')) return v; const c = Object.assign({}, v); delete c.img; return c; };
   const cloudEntries = () => { const o = {}; Object.keys(entries).forEach(id => { o[id] = noImg(entries[id]); }); return o; };
-  return { hydrated, sync, lsEntries, lsCustom, lsInvoices, cloudEntries, noImg };
+  return { hydrated, sync, slots, lsEntries, lsCustom, lsInvoices, cloudEntries, noImg };
 })();
 
 /* ---------- Live Cloud Sync Engine ---------- */
@@ -809,6 +809,7 @@ function checkUrlSyncParam() {
   return null;
 }
 
+let cloudDirty = false;   // local changes not yet confirmed on the cloud
 let cloudSyncTimer = null;
 function triggerCloudSyncDebounced(delay = 1400) {
   if (!isCloudSyncEnabled()) return;
@@ -850,6 +851,63 @@ function updateCloudSyncStatusIndicator(state, timestamp = null, errorMsg = '') 
   }
 }
 
+
+/* ---------- photos travel separately (Firebase only) so the main payload stays tiny ---------- */
+const imgSig = v => v.length + ':' + v.slice(-24);
+function fbBase(){
+  const u = (lsGet('clinic_cloud_firebase_url') || '').trim().replace(/\/$/, '');
+  return (getCloudSyncProvider() === 'firebase' && u) ? u : null;
+}
+const photoUrl = (base, name) => `${base}/clinic_photos/${encodeURIComponent(getCloudSyncKey())}${name ? '/' + name : ''}.json`;
+function readPhotoDone(){ try{ return JSON.parse(lsGet('clinic_img_synced') || '{}') || {}; }catch(e){ return {}; } }
+// signatures of the photos that are already uploaded and still current on this device
+function currentPhotoSigs(){
+  const done = readPhotoDone(), out = {};
+  ImgStore.slots().forEach(([k, o]) => { if(isDataImg(o.img) && done[k] === imgSig(o.img)) out[k.replace(':', '_')] = done[k]; });
+  return out;
+}
+async function pushPhotosToFirebase(){
+  const base = fbBase(); if(!base) return;
+  const done = readPhotoDone();
+  for(const [k, o] of ImgStore.slots()){
+    if(!isDataImg(o.img)) continue;
+    const sig = imgSig(o.img);
+    if(done[k] === sig) continue;
+    const r = await fetch(photoUrl(base, k.replace(':', '_')), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(o.img) });
+    if(!r.ok) throw new Error('HTTP ' + r.status + ' (photo)');
+    done[k] = sig;
+    lsSet('clinic_img_synced', JSON.stringify(done), true);
+  }
+}
+function photoHolder(kind, id){
+  if(kind === 'e') return entries[id] || (entries[id] = { b: [], r: '', nt: '' });
+  if(kind === 'c') return customItems.find(x => String(x.id) === id);
+  if(kind === 'v') return companyInvoices.find(x => x.id === id);
+  return null;
+}
+// remoteSigs: {name: sig}. replaceStale=true when we just took the newer remote data (remote photo wins);
+// otherwise only photos this device lacks are filled in.
+async function pullPhotosFromFirebase(remoteSigs, replaceStale){
+  const base = fbBase(); if(!base || !remoteSigs || typeof remoteSigs !== 'object') return;
+  const done = readPhotoDone();
+  let changed = false;
+  for(const name of Object.keys(remoteSigs)){
+    const m = /^([ecv])_(.+)$/.exec(name); if(!m) continue;
+    const key = m[1] + ':' + m[2];
+    const cur = (m[1] === 'e' ? (entries[m[2]] || {}) : (photoHolder(m[1], m[2]) || {})).img;
+    if(cur === '__NONE__') continue;
+    const have = isDataImg(cur);
+    if(have && (!replaceStale || imgSig(cur) === remoteSigs[name])) { done[key] = imgSig(cur) === remoteSigs[name] ? remoteSigs[name] : done[key]; continue; }
+    const holder = photoHolder(m[1], m[2]); if(!holder) continue;
+    const r = await fetch(photoUrl(base, name) + '?t=' + Date.now(), { cache: 'no-store' });
+    if(!r.ok) continue;
+    const v = await r.json();
+    if(isDataImg(v)){ holder.img = v; done[key] = imgSig(v); changed = true; }
+  }
+  lsSet('clinic_img_synced', JSON.stringify(done), true);
+  if(changed){ saveLocal(true); render(); }
+}
+
 async function pushClinicDataToCloud(showToast = false, keepAlive = false) {
   if (!isCloudSyncEnabled()) return false;
   const syncKey = getCloudSyncKey();
@@ -875,6 +933,8 @@ async function pushClinicDataToCloud(showToast = false, keepAlive = false) {
   updateCloudSyncStatusIndicator('syncing');
 
   try {
+    if (!keepAlive) await pushPhotosToFirebase();   // photos first, so other devices find them
+    payload.photoSigs = currentPhotoSigs();
     const provider = getCloudSyncProvider();
     let url = '';
     let method = 'PUT';
@@ -907,6 +967,7 @@ async function pushClinicDataToCloud(showToast = false, keepAlive = false) {
     const now = Date.now();
     lsSet('clinic_cloud_last_synced', String(now));
     lsSet('clinic_gdrive_last_synced', String(now));
+    cloudDirty = false;
     updateCloudSyncStatusIndicator('synced', now);
     if (showToast) toast('☁️ تم حفظ ومزامنة البيانات مع Google Drive والسحابة بنجاح');
     return true;
@@ -966,6 +1027,7 @@ async function pullClinicDataFromCloud(silent = false) {
     // If remote has valid work and is newer OR this device has no local work yet:
     if (remoteUpdated > localUpdated || (!hasLocalWork && remoteUpdated > 0)) {
       applyCloudData(remoteData);
+      await pullPhotosFromFirebase(remoteData.photoSigs, true);
       lsSet('clinic_cloud_last_synced', String(Date.now()));
       updateCloudSyncStatusIndicator('synced', Date.now());
       if (!silent) toast('☁️ تم تحميل ومزامنة أحدث بيانات العيادة من السحابة بنجاح');
@@ -975,6 +1037,7 @@ async function pullClinicDataFromCloud(silent = false) {
       lsSet('clinic_local_updated_at', String(now));
       await pushClinicDataToCloud(false);
     } else {
+      await pullPhotosFromFirebase(remoteData.photoSigs, false);
       updateCloudSyncStatusIndicator('synced', Date.now());
     }
   } catch (err) {
@@ -1330,6 +1393,7 @@ function saveLocal(skipCloud = false){
   if(!skipCloud){
     const now = Date.now();
     lsSet('clinic_local_updated_at', String(now));
+    cloudDirty = true;
     triggerCloudSyncDebounced();
   }
 }
@@ -1879,11 +1943,13 @@ function autoSaveAll(showToast = false){
   saveLocal();
   if(showToast) toast('تم الحفظ تلقائياً');
 }
-window.addEventListener('beforeunload', () => {
+window.addEventListener('beforeunload', (e) => {
+  const unsynced = isCloudSyncEnabled() && cloudDirty;   // evaluate before the final save below
   autoSaveAll(false);
   if (typeof syncToGoogleDriveNow === 'function') {
     syncToGoogleDriveNow(false, true); // true = keepalive for browser exit guarantee
   }
+  if (unsynced) { e.preventDefault(); e.returnValue = ''; }   // browser asks: leave anyway? only when the cloud copy is behind
 });
 window.addEventListener('pagehide', () => {
   autoSaveAll(false);

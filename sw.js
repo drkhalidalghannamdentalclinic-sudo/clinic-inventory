@@ -1,6 +1,6 @@
 // Offline support for the clinic inventory app.
 // Bump VERSION whenever index.html changes so phones and PCs pick up the update.
-const VERSION = 'clinic-inv-v5';
+const VERSION = 'clinic-inv-v6';
 const SHELL = ['./', './index.html', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png',
   './icons/apple-touch-icon.png', './icons/favicon.png'];
