@@ -781,7 +781,7 @@ function setCloudSyncEnabled(enabled) {
 }
 
 function getCloudSyncProvider() {
-  return lsGet('clinic_cloud_sync_provider') || 'extendsclass';
+  return lsGet('clinic_cloud_sync_provider') || (GOOGLE_CLIENT_ID ? 'gdrive' : 'extendsclass');
 }
 
 function setCloudSyncProvider(p) {
@@ -843,6 +843,7 @@ function updateCloudSyncStatusIndicator(state, timestamp = null, errorMsg = '') 
   } else if (state === 'error') {
     icon.innerHTML = '⚠️';
     text.textContent = 'السحابة: غير متصل';
+    if (errorMsg === 'NEEDS_AUTH') errorMsg = 'اربط حساب Google Drive (إعدادات السحابة) أو المس الشاشة لإعادة الاتصال';
     if (btn) btn.title = 'تعذر الاتصال بالسحابة: ' + (errorMsg || 'يرجى التحقق من الإنترنت') + ' (البيانات محفوظة على الجهاز محلياً)';
   } else if (state === 'disabled') {
     icon.innerHTML = '☁️';
@@ -852,13 +853,111 @@ function updateCloudSyncStatusIndicator(state, timestamp = null, errorMsg = '') 
 }
 
 
-/* ---------- photos travel separately (Firebase only) so the main payload stays tiny ---------- */
-const imgSig = v => v.length + ':' + v.slice(-24);
-function fbBase(){
-  const u = (lsGet('clinic_cloud_firebase_url') || '').trim().replace(/\/$/, '');
-  return (getCloudSyncProvider() === 'firebase' && u) ? u : null;
+/* ---------- Google Drive sync (hidden app folder: free, private, no card) ---------- */
+// One-time setup: paste the OAuth *Web* client ID (public, safe to commit) from Google Cloud Console.
+const GOOGLE_CLIENT_ID = '';
+const GD_SCOPE = 'https://www.googleapis.com/auth/drive.appdata';
+const GD_API = () => window.__GD_BASE || 'https://www.googleapis.com';
+let gdToken = null, gdExpires = 0, gdClient = null, gdReauthArmed = false;
+let gdIds = {}; try{ gdIds = JSON.parse(lsGet('clinic_gd_ids') || '{}') || {}; }catch(e){}
+const gdSaveIds = () => lsSet('clinic_gd_ids', JSON.stringify(gdIds), true);
+function gdLoadScript(){
+  return new Promise((res, rej) => {
+    if(window.google && google.accounts && google.accounts.oauth2) return res();
+    const sc = document.createElement('script');
+    sc.src = 'https://accounts.google.com/gsi/client';
+    sc.onload = () => res(); sc.onerror = () => rej(new Error('تعذر تحميل خدمة Google'));
+    document.head.appendChild(sc);
+  });
 }
-const photoUrl = (base, name) => `${base}/clinic_photos/${encodeURIComponent(getCloudSyncKey())}${name ? '/' + name : ''}.json`;
+// prompt: '' = silent when already granted, 'consent' = first connection. Needs a user gesture if a popup is required.
+function gdRequestToken(prompt){
+  return gdLoadScript().then(() => new Promise((res, rej) => {
+    if(!gdClient) gdClient = google.accounts.oauth2.initTokenClient({ client_id: GOOGLE_CLIENT_ID, scope: GD_SCOPE, callback: () => {}, error_callback: () => {} });
+    gdClient.callback = r => {
+      if(r && r.access_token){ gdToken = r.access_token; gdExpires = Date.now() + ((r.expires_in || 3600) - 120) * 1000; lsSet('clinic_gd_connected', '1', true); res(gdToken); }
+      else rej(new Error((r && r.error) || 'auth'));
+    };
+    gdClient.error_callback = e => rej(new Error((e && e.type) || 'auth'));
+    gdClient.requestAccessToken({ prompt });
+  }));
+}
+// token expired (they last ~1h): renew on the very next tap, because that is when the browser allows the Google popup
+function gdArmReauth(){
+  if(gdReauthArmed || !GOOGLE_CLIENT_ID || !lsGet('clinic_gd_connected')) return;
+  gdReauthArmed = true;
+  updateCloudSyncStatusIndicator('error', null, 'لمسة واحدة لإعادة الاتصال بـ Google Drive');
+  const h = async () => {
+    document.removeEventListener('pointerdown', h, true);
+    gdReauthArmed = false;
+    try{ await gdRequestToken(''); pullClinicDataFromCloud(true); }catch(e){ gdArmReauth(); }
+  };
+  document.addEventListener('pointerdown', h, true);
+}
+async function gdFetch(url, opts, keepalive){
+  if(!(gdToken && Date.now() < gdExpires)) throw new Error('NEEDS_AUTH');
+  const o = Object.assign({}, opts || {});
+  o.headers = Object.assign({}, o.headers || {}, { Authorization: 'Bearer ' + gdToken });
+  if(keepalive) o.keepalive = true;
+  const r = await fetch(url, o);
+  if(r.status === 401){ gdToken = null; throw new Error('NEEDS_AUTH'); }
+  return r;
+}
+async function gdFindId(name){
+  if(gdIds[name]) return gdIds[name];
+  const q = encodeURIComponent("name='" + name + "'");
+  const r = await gdFetch(`${GD_API()}/drive/v3/files?spaces=appDataFolder&q=${q}&fields=files(id)`);
+  if(!r.ok) throw new Error('Drive HTTP ' + r.status);
+  const j = await r.json();
+  const id = j.files && j.files[0] && j.files[0].id;
+  if(id){ gdIds[name] = id; gdSaveIds(); }
+  return id || null;
+}
+async function gdWrite(name, text, keepalive){
+  let id = gdIds[name] || (keepalive ? null : await gdFindId(name));
+  if(!id && keepalive) throw new Error('no cached file id');
+  let r;
+  if(id){
+    r = await gdFetch(`${GD_API()}/upload/drive/v3/files/${id}?uploadType=media`, { method: 'PATCH', headers: { 'Content-Type': 'application/json; charset=utf-8' }, body: text }, keepalive);
+    if(r.status === 404){ delete gdIds[name]; gdSaveIds(); id = null; }
+  }
+  if(!id){
+    const bd = 'clinicbd' + Date.now();
+    const body = `--${bd}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({ name, parents: ['appDataFolder'] })}\r\n--${bd}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${text}\r\n--${bd}--`;
+    r = await gdFetch(`${GD_API()}/upload/drive/v3/files?uploadType=multipart&fields=id`, { method: 'POST', headers: { 'Content-Type': 'multipart/related; boundary=' + bd }, body }, keepalive);
+    if(r.ok){ const j = await r.json(); if(j && j.id){ gdIds[name] = j.id; gdSaveIds(); } }
+  }
+  if(!r.ok) throw new Error('Drive HTTP ' + r.status);
+}
+async function gdRead(name){
+  let id = await gdFindId(name);
+  if(!id) return null;
+  let r = await gdFetch(`${GD_API()}/drive/v3/files/${id}?alt=media`);
+  if(r.status === 404){ delete gdIds[name]; gdSaveIds(); return null; }
+  if(!r.ok) throw new Error('Drive HTTP ' + r.status);
+  return r.text();
+}
+
+/* ---------- photos travel separately from the main payload (Firebase / Google Drive) ---------- */
+const imgSig = v => v.length + ':' + v.slice(-24);
+function photoTransport(){
+  const prov = getCloudSyncProvider();
+  if(prov === 'gdrive' && GOOGLE_CLIENT_ID){
+    return {
+      put: (name, v) => gdWrite('photo_' + name + '.json', JSON.stringify(v)),
+      get: async name => { const t = await gdRead('photo_' + name + '.json'); return t ? JSON.parse(t) : null; }
+    };
+  }
+  const base = (lsGet('clinic_cloud_firebase_url') || '').trim().replace(/\/$/, '');
+  if(prov === 'firebase' && base){
+    const u = name => `${base}/clinic_photos/${encodeURIComponent(getCloudSyncKey())}/${name}.json`;
+    return {
+      put: async (name, v) => { const r = await fetch(u(name), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(v) }); if(!r.ok) throw new Error('HTTP ' + r.status + ' (photo)'); },
+      get: async name => { const r = await fetch(u(name) + '?t=' + Date.now(), { cache: 'no-store' }); return r.ok ? r.json() : null; }
+    };
+  }
+  return null;
+}
 function readPhotoDone(){ try{ return JSON.parse(lsGet('clinic_img_synced') || '{}') || {}; }catch(e){ return {}; } }
 // signatures of the photos that are already uploaded and still current on this device
 function currentPhotoSigs(){
@@ -866,15 +965,14 @@ function currentPhotoSigs(){
   ImgStore.slots().forEach(([k, o]) => { if(isDataImg(o.img) && done[k] === imgSig(o.img)) out[k.replace(':', '_')] = done[k]; });
   return out;
 }
-async function pushPhotosToFirebase(){
-  const base = fbBase(); if(!base) return;
+async function pushPhotos(){
+  const tr = photoTransport(); if(!tr) return;
   const done = readPhotoDone();
   for(const [k, o] of ImgStore.slots()){
     if(!isDataImg(o.img)) continue;
     const sig = imgSig(o.img);
     if(done[k] === sig) continue;
-    const r = await fetch(photoUrl(base, k.replace(':', '_')), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(o.img) });
-    if(!r.ok) throw new Error('HTTP ' + r.status + ' (photo)');
+    await tr.put(k.replace(':', '_'), o.img);
     done[k] = sig;
     lsSet('clinic_img_synced', JSON.stringify(done), true);
   }
@@ -887,8 +985,8 @@ function photoHolder(kind, id){
 }
 // remoteSigs: {name: sig}. replaceStale=true when we just took the newer remote data (remote photo wins);
 // otherwise only photos this device lacks are filled in.
-async function pullPhotosFromFirebase(remoteSigs, replaceStale){
-  const base = fbBase(); if(!base || !remoteSigs || typeof remoteSigs !== 'object') return;
+async function pullPhotos(remoteSigs, replaceStale){
+  const tr = photoTransport(); if(!tr || !remoteSigs || typeof remoteSigs !== 'object') return;
   const done = readPhotoDone();
   let changed = false;
   for(const name of Object.keys(remoteSigs)){
@@ -896,12 +994,9 @@ async function pullPhotosFromFirebase(remoteSigs, replaceStale){
     const key = m[1] + ':' + m[2];
     const cur = (m[1] === 'e' ? (entries[m[2]] || {}) : (photoHolder(m[1], m[2]) || {})).img;
     if(cur === '__NONE__') continue;
-    const have = isDataImg(cur);
-    if(have && (!replaceStale || imgSig(cur) === remoteSigs[name])) { done[key] = imgSig(cur) === remoteSigs[name] ? remoteSigs[name] : done[key]; continue; }
+    if(isDataImg(cur) && (!replaceStale || imgSig(cur) === remoteSigs[name])){ if(imgSig(cur) === remoteSigs[name]) done[key] = remoteSigs[name]; continue; }
     const holder = photoHolder(m[1], m[2]); if(!holder) continue;
-    const r = await fetch(photoUrl(base, name) + '?t=' + Date.now(), { cache: 'no-store' });
-    if(!r.ok) continue;
-    const v = await r.json();
+    const v = await tr.get(name);
     if(isDataImg(v)){ holder.img = v; done[key] = imgSig(v); changed = true; }
   }
   lsSet('clinic_img_synced', JSON.stringify(done), true);
@@ -933,7 +1028,7 @@ async function pushClinicDataToCloud(showToast = false, keepAlive = false) {
   updateCloudSyncStatusIndicator('syncing');
 
   try {
-    if (!keepAlive) await pushPhotosToFirebase();   // photos first, so other devices find them
+    if (!keepAlive) await pushPhotos();   // photos first, so other devices find them
     payload.photoSigs = currentPhotoSigs();
     const provider = getCloudSyncProvider();
     let url = '';
@@ -947,6 +1042,8 @@ async function pushClinicDataToCloud(showToast = false, keepAlive = false) {
     } else if (provider === 'custom') {
       url = (lsGet('clinic_cloud_custom_url') || '').trim();
       if (!url) throw new Error('يرجى تحديد رابط الخادم المخصص');
+    } else if (provider === 'gdrive') {
+      // no URL: handled through the Drive API below
     } else {
       url = `https://json.extendsclass.com/bin/${encodeURIComponent(syncKey)}`;
     }
@@ -960,9 +1057,12 @@ async function pushClinicDataToCloud(showToast = false, keepAlive = false) {
       fetchOptions.keepalive = true;
     }
 
-    const res = await fetch(url, fetchOptions);
-
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (provider === 'gdrive') {
+      await gdWrite('clinic-data.json', fetchOptions.body, keepAlive);
+    } else {
+      const res = await fetch(url, fetchOptions);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+    }
 
     const now = Date.now();
     lsSet('clinic_cloud_last_synced', String(now));
@@ -973,6 +1073,7 @@ async function pushClinicDataToCloud(showToast = false, keepAlive = false) {
     return true;
   } catch (err) {
     console.warn('Cloud push warning:', err);
+    if (err && err.message === 'NEEDS_AUTH') gdArmReauth();
     updateCloudSyncStatusIndicator('error', null, err.message);
     if (showToast) toast('⚠️ تعذر المزامنة مع السحابة (البيانات محفوظة على جهازك محلياً)');
     return false;
@@ -998,18 +1099,29 @@ async function pullClinicDataFromCloud(silent = false) {
       url = (lsGet('clinic_cloud_custom_url') || '').trim();
       if (!url) return;
       url += (url.includes('?') ? '&' : '?') + 't=' + Date.now();
+    } else if (provider === 'gdrive') {
+      // no URL: handled through the Drive API below
     } else {
       url = `https://json.extendsclass.com/bin/${encodeURIComponent(syncKey)}?t=${Date.now()}`;
     }
 
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: { 'Accept': 'application/json' },
-      cache: 'no-store'
-    });
-
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    let remoteData = await res.json();
+    let remoteData;
+    if (provider === 'gdrive') {
+      const txt = await gdRead('clinic-data.json');
+      if (!txt) {   // nothing on Drive yet: seed it with this device's data
+        await pushClinicDataToCloud(false);
+        return;
+      }
+      remoteData = JSON.parse(txt);
+    } else {
+      const res = await fetch(url, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json' },
+        cache: 'no-store'
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      remoteData = await res.json();
+    }
 
     if (remoteData && typeof remoteData === 'object' && remoteData.data && typeof remoteData.data === 'string') {
       try { remoteData = JSON.parse(remoteData.data); } catch (e) {}
@@ -1027,7 +1139,7 @@ async function pullClinicDataFromCloud(silent = false) {
     // If remote has valid work and is newer OR this device has no local work yet:
     if (remoteUpdated > localUpdated || (!hasLocalWork && remoteUpdated > 0)) {
       applyCloudData(remoteData);
-      await pullPhotosFromFirebase(remoteData.photoSigs, true);
+      await pullPhotos(remoteData.photoSigs, true);
       lsSet('clinic_cloud_last_synced', String(Date.now()));
       updateCloudSyncStatusIndicator('synced', Date.now());
       if (!silent) toast('☁️ تم تحميل ومزامنة أحدث بيانات العيادة من السحابة بنجاح');
@@ -1037,11 +1149,12 @@ async function pullClinicDataFromCloud(silent = false) {
       lsSet('clinic_local_updated_at', String(now));
       await pushClinicDataToCloud(false);
     } else {
-      await pullPhotosFromFirebase(remoteData.photoSigs, false);
+      await pullPhotos(remoteData.photoSigs, false);
       updateCloudSyncStatusIndicator('synced', Date.now());
     }
   } catch (err) {
     console.warn('Cloud pull warning:', err);
+    if (err && err.message === 'NEEDS_AUTH') { gdArmReauth(); updateCloudSyncStatusIndicator('error', null, 'NEEDS_AUTH'); return; }
     updateCloudSyncStatusIndicator('error', null, err.message);
   }
 }
@@ -1170,6 +1283,15 @@ function openCloudSyncModal() {
     </div>
   </div>
 
+  ${GOOGLE_CLIENT_ID ? `<div style="background:var(--brand-soft);border:1px solid var(--brand);border-radius:14px;padding:12px;margin-bottom:14px">
+    <div style="font-weight:700;color:var(--brand);margin-bottom:6px">📁 Google Drive (مجاني — نسخة احتياطية وتزامن كامل بالصور)</div>
+    <div style="font-size:.82rem;color:var(--muted);margin-bottom:8px">يحفظ في مجلد خاص مخفي بتطبيقك داخل Drive الخاص بحسابك فقط. اربطه مرة على كل جهاز بنفس الحساب.</div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button class="btn small primary" id="btnGdConnect" type="button">🔗 ${lsGet('clinic_gd_connected') ? 'إعادة ربط Google Drive' : 'ربط Google Drive'}</button>
+      <span id="gdConnState" style="font-size:.82rem">${gdToken && Date.now() < gdExpires ? '🟢 متصل' : (lsGet('clinic_gd_connected') ? '🟡 مرتبط — يتجدد بلمسة' : '⚪ غير مربوط')}</span>
+    </div>
+  </div>` : ''}
+
   <div class="field">
     <label for="txtSyncKey">🔑 كود المزامنة السحابي الموحد لعيادتك (Sync Key)</label>
     <div style="display:flex;gap:8px;align-items:center">
@@ -1207,6 +1329,7 @@ function openCloudSyncModal() {
       <div>
         <label style="font-size:.84rem;font-weight:600;display:block;margin-bottom:4px">مزود الخدمة السحابية</label>
         <select id="selCsProvider" class="txt" style="width:100%;padding:8px;border-radius:8px">
+          ${GOOGLE_CLIENT_ID ? `<option value="gdrive" ${provider === 'gdrive' ? 'selected' : ''}>Google Drive (مجاني وخاص بحسابك — موصى به)</option>` : ''}
           <option value="extendsclass" ${provider === 'extendsclass' ? 'selected' : ''}>سحابة ExtendsClass الفورية (مجاني وسريع - افتراضي)</option>
           <option value="firebase" ${provider === 'firebase' ? 'selected' : ''}>Google Firebase Realtime Database (سحابي مخصص)</option>
           <option value="custom" ${provider === 'custom' ? 'selected' : ''}>رابط خادم مخصص (Custom Endpoint)</option>
@@ -1310,6 +1433,19 @@ function openCloudSyncModal() {
     closeSheet();
   };
 
+  if ($('btnGdConnect')) {
+    $('btnGdConnect').onclick = async () => {
+      try {
+        await gdRequestToken(lsGet('clinic_gd_connected') ? '' : 'consent');
+        setCloudSyncProvider('gdrive');
+        setCloudSyncEnabled(true);
+        $('gdConnState').textContent = '🟢 متصل';
+        $('selCsProvider').value = 'gdrive';
+        toast('تم ربط Google Drive ✅ جاري المزامنة...');
+        await pullClinicDataFromCloud(false);
+      } catch (e) { toast('تعذر الربط بـ Google Drive: ' + e.message); }
+    };
+  }
   $('selCsProvider').onchange = (e) => {
     const val = e.target.value;
     setCloudSyncProvider(val);
