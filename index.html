@@ -626,6 +626,7 @@ function startContinuousAlertSound(type = 'urgent', reason = '') {
 }
 
 function stopContinuousAlertSound() {
+  const wasActive = isSoundAlarmActive || !!activeAlertLoopTimer;
   isSoundAlarmActive = false;
   if (activeAlertLoopTimer) {
     clearInterval(activeAlertLoopTimer);
@@ -635,7 +636,7 @@ function stopContinuousAlertSound() {
   if (bar) bar.style.display = 'none';
 
   updateTestSoundBtnState(false);
-  toast('⏹️ تم إيقاف التنبيه الصوتي بنجاح');
+  if (wasActive) toast('⏹️ تم إيقاف التنبيه الصوتي بنجاح');
 }
 
 function updateTestSoundBtnState(isPlaying) {
@@ -1022,7 +1023,8 @@ async function pushClinicDataToCloud(showToast = false, keepAlive = false) {
     itemCompanies: itemCompanies || {},
     placedOrders: placedOrders || {},
     companyInvoices: (companyInvoices || []).map(ImgStore.noImg),
-    companyPayments: companyPayments || []
+    companyPayments: companyPayments || [],
+    staffList: getStaffList()
   };
 
   updateCloudSyncStatusIndicator('syncing');
@@ -1182,6 +1184,11 @@ function applyCloudData(data) {
     if (typeof updateLogoDisplay === 'function') updateLogoDisplay();
   }
   if (data.months && data.months > 0 && data.months <= 36) months = data.months;
+  if (Array.isArray(data.staffList) && data.staffList.length) {
+    lsSet('clinic_staff_list', JSON.stringify(data.staffList));
+    const lm = $('loginModal');
+    if (lm && lm.style.display === 'flex' && !(currentSession && currentSession.staff)) openLoginModal(false);   // refresh a stale sign-in / first-time screen
+  }
   const restoreImg = (k, o) => { if(o && (!o.img || (o.img !== '__NONE__' && !isDataImg(o.img))) && prevImgs.has(k)) o.img = prevImgs.get(k); };
   // a photo-only entry that the remote no longer has must not lose its photo
   prevImgs.forEach((v, k) => { if(k.startsWith('e:') && !entries[k.slice(2)]) entries[k.slice(2)] = { b: [], r: '', nt: '', img: v }; });
@@ -5590,6 +5597,10 @@ function getStaffList(){
 }
 function saveStaffList(list){
   lsSet('clinic_staff_list', JSON.stringify(list));
+  // staff names are shared settings: mark as changed so every device gets them
+  lsSet('clinic_local_updated_at', String(Date.now()));
+  cloudDirty = true;
+  triggerCloudSyncDebounced();
 }
 function getTodayIso() {
   const d = new Date();
@@ -5728,6 +5739,7 @@ function openLoginModal(canCancel = false) {
 function openStaffManager(canCancel) {
   const staffList = getStaffList();
   const card = $('loginCard');
+  $('loginModal').style.display = 'flex';   // it is also opened from Settings, where the overlay is still hidden
   card.innerHTML = `
     <h2 class="login-title">إدارة قائمة الموظفين</h2>
     <p class="login-sub">إضافة أو حذف أسماء الموظفين المسجلين في النظام</p>
@@ -5751,8 +5763,10 @@ function openStaffManager(canCancel) {
 
     <div class="login-actions">
       <button type="button" class="btn primary" id="btnBackToLogin">العودة لشاشة الدخول</button>
+      ${canCancel ? '<button type="button" class="btn ghost small" id="btnCloseStaffMgr">إغلاق</button>' : ''}
     </div>
   `;
+  if ($('btnCloseStaffMgr')) $('btnCloseStaffMgr').onclick = () => { $('loginModal').style.display = 'none'; };
 
   card.querySelectorAll('.delStaffBtn').forEach(btn => {
     btn.onclick = () => {
