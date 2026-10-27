@@ -844,7 +844,7 @@ function updateCloudSyncStatusIndicator(state, timestamp = null, errorMsg = '') 
   } else if (state === 'error') {
     icon.innerHTML = '⚠️';
     text.textContent = 'السحابة: غير متصل';
-    if (errorMsg === 'NEEDS_AUTH') errorMsg = 'اربط حساب Google Drive (إعدادات السحابة) أو المس الشاشة لإعادة الاتصال';
+    if (errorMsg === 'NEEDS_AUTH') errorMsg = 'المزامنة متوقفة مؤقتاً: اضغط «مزامنة مع Google Drive الآن» في الإعدادات (مرة كل ساعة تقريباً)';
     if (btn) btn.title = 'تعذر الاتصال بالسحابة: ' + (errorMsg || 'يرجى التحقق من الإنترنت') + ' (البيانات محفوظة على الجهاز محلياً)';
   } else if (state === 'disabled') {
     icon.innerHTML = '☁️';
@@ -860,6 +860,10 @@ const GOOGLE_CLIENT_ID = '66755429991-l5l6ibo3gbkamgqep67dg4ernvqt7oom.apps.goog
 const GD_SCOPE = 'https://www.googleapis.com/auth/drive.appdata';
 const GD_API = () => window.__GD_BASE || 'https://www.googleapis.com';
 let gdToken = null, gdExpires = 0, gdClient = null, gdReauthArmed = false;
+try{   // reuse the token across reloads/tabs while it is still valid (about 1 hour), so refreshing never asks to sign in again
+  const _t = JSON.parse(lsGet('clinic_gd_tok') || 'null');
+  if(_t && _t.t && _t.exp > Date.now()){ gdToken = _t.t; gdExpires = _t.exp; }
+}catch(e){}
 let gdIds = {}; try{ gdIds = JSON.parse(lsGet('clinic_gd_ids') || '{}') || {}; }catch(e){}
 const gdSaveIds = () => lsSet('clinic_gd_ids', JSON.stringify(gdIds), true);
 function gdLoadScript(){
@@ -876,22 +880,26 @@ function gdRequestToken(prompt){
   return gdLoadScript().then(() => new Promise((res, rej) => {
     if(!gdClient) gdClient = google.accounts.oauth2.initTokenClient({ client_id: GOOGLE_CLIENT_ID, scope: GD_SCOPE, callback: () => {}, error_callback: () => {} });
     gdClient.callback = r => {
-      if(r && r.access_token){ gdToken = r.access_token; gdExpires = Date.now() + ((r.expires_in || 3600) - 120) * 1000; lsSet('clinic_gd_connected', '1', true); res(gdToken); }
+      if(r && r.access_token){ gdToken = r.access_token; gdExpires = Date.now() + ((r.expires_in || 3600) - 120) * 1000; lsSet('clinic_gd_connected', '1', true); lsSet('clinic_gd_tok', JSON.stringify({ t: gdToken, exp: gdExpires }), true); res(gdToken); }
       else rej(new Error((r && r.error) || 'auth'));
     };
     gdClient.error_callback = e => rej(new Error((e && e.type) || 'auth'));
     gdClient.requestAccessToken({ prompt });
   }));
 }
-// token expired (they last ~1h): renew on the very next tap, because that is when the browser allows the Google popup
+// token expired (they last ~1h): try ONE silent renewal per browser session on the next tap (no account chooser).
+// If Google needs a visible sign-in, we stop and wait for the user to press the sync button; never nag on every refresh.
 function gdArmReauth(){
   if(gdReauthArmed || !GOOGLE_CLIENT_ID || !lsGet('clinic_gd_connected')) return;
+  let tried = false; try{ tried = sessionStorage.getItem('clinic_gd_silent_tried') === '1'; }catch(e){}
+  updateCloudSyncStatusIndicator('error', null, 'NEEDS_AUTH');
+  if(tried) return;
   gdReauthArmed = true;
-  updateCloudSyncStatusIndicator('error', null, 'لمسة واحدة لإعادة الاتصال بـ Google Drive');
   const h = async () => {
     document.removeEventListener('pointerdown', h, true);
     gdReauthArmed = false;
-    try{ await gdRequestToken(''); pullClinicDataFromCloud(true); }catch(e){ gdArmReauth(); }
+    try{ sessionStorage.setItem('clinic_gd_silent_tried', '1'); }catch(e){}
+    try{ await gdRequestToken('none'); pullClinicDataFromCloud(true); }catch(e){}
   };
   document.addEventListener('pointerdown', h, true);
 }
