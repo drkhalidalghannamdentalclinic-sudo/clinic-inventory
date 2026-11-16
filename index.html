@@ -1034,6 +1034,8 @@ async function pushClinicDataToCloud(showToast = false, keepAlive = false) {
     companyPayments: companyPayments || [],
     staffList: getStaffList()
   };
+  // The Gemini key travels ONLY through the user's private Google Drive folder, never through public/other providers.
+  if (getCloudSyncProvider() === 'gdrive' && getGeminiApiKey()) payload.geminiApiKey = getGeminiApiKey();
 
   updateCloudSyncStatusIndicator('syncing');
 
@@ -1192,6 +1194,9 @@ function applyCloudData(data) {
     if (typeof updateLogoDisplay === 'function') updateLogoDisplay();
   }
   if (data.months && data.months > 0 && data.months <= 36) months = data.months;
+  if (getCloudSyncProvider() === 'gdrive' && typeof data.geminiApiKey === 'string' && data.geminiApiKey.trim()) {
+    lsSet('clinic_gemini_api_key', data.geminiApiKey.trim());
+  }
   if (Array.isArray(data.staffList) && data.staffList.length) {
     lsSet('clinic_staff_list', JSON.stringify(data.staffList));
     const lm = $('loginModal');
@@ -3502,6 +3507,9 @@ function getGeminiApiKey(){
 }
 function setGeminiApiKey(k){
   lsSet('clinic_gemini_api_key', (k || '').trim());
+  lsSet('clinic_local_updated_at', String(Date.now()));   // shared setting: push it to the other devices
+  cloudDirty = true;
+  triggerCloudSyncDebounced();
 }
 
 async function analyzeInvoiceWithGeminiAI(dataUrl, progressCb){
